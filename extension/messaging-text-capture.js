@@ -29,10 +29,28 @@
   // e.g. new Set(['safe']) to only display warnings.
   const HIDDEN_LABELS = new Set();
 
-  // true = don't classify messages you sent yourself (only works where OWN_MESSAGE_SELECTORS
-  // has an entry). Leave false while testing with "message yourself".
-  const SKIP_OWN_MESSAGES = false;
-  const OWN_MESSAGE_SELECTORS = { 'web.whatsapp.com': '.message-out' };
+  // true = only analyse INCOMING messages; messages you sent are ignored (not stored, not
+  // sent to the model, no badge). Only works on sites listed in OWN_MESSAGE_SELECTORS,
+  // which must match an ancestor of every message you sent. Other sites still check everything.
+  // NOTE: in WhatsApp's "message yourself" chat every message counts as sent by you.
+  const SKIP_OWN_MESSAGES = true;
+  const OWN_MESSAGE_SELECTORS = {
+    // .message-out = WhatsApp's class for sent bubbles; data-id="true_..." is its sent-message id.
+    // Either one matching is enough, so a markup change to one doesn't break the filter.
+    'web.whatsapp.com': '.message-out, [data-id^="true_"]',
+    // Telegram Web K marks sent bubbles .is-out; Web A marks them .own
+    'web.telegram.org': '.bubble.is-out, .Message.own',
+  };
+
+  // Backup that does not depend on any class names: on these sites a bubble that sits on the
+  // RIGHT side of the chat pane is one you sent, on the LEFT is one you received.
+  const OWN_BY_POSITION = new Set(['web.whatsapp.com', 'web.telegram.org']);
+  const PANE_SELECTOR = '#main, #column-center, #MiddleColumn'; // chat pane; falls back to the window
+
+  // Quoted/replied-to text shown inside a bubble is not a separate message.
+  const SKIP_INSIDE_SELECTORS = {
+    'web.whatsapp.com': '[aria-label^="Quoted"], [data-testid="quoted-message"]',
+  };
 
   // Selectors for the element holding the TEXT of a message. Tried in order; the first one
   // that matches any message wins. These depend on each site's markup and can break when
@@ -41,6 +59,20 @@
     'web.whatsapp.com': ['[data-pre-plain-text] span.selectable-text', 'span.selectable-text.copyable-text'],
     'discord.com': ['[id^="message-content-"]'],
     'app.slack.com': ['.p-rich_text_section'],
+    // Telegram Web A (/a/) first, then Web K (/k/). Best guesses; see the README notes in chat.
+    'web.telegram.org': [
+      '.Message .text-content',          // Web A
+      '.bubble-content .message',        // Web K
+      '.bubble .message',
+      '.message.spoilers-container',
+      '.text-content',
+    ],
+  };
+
+  // Parts INSIDE a message element that are not message text (time, ticks, reactions).
+  // They are removed from a copy of the element before its text is read.
+  const TEXT_IGNORE_SELECTORS = {
+    'web.telegram.org': '.MessageMeta, .time, .reactions, .Reactions',
   };
 
   // A message that is only a clock time is never a real message.
@@ -56,6 +88,7 @@
   let classifying = false;
   let retryAfter = 0;
   let warnedNoSelector = false;
+  let matchedEver = false;
 
   const seenThisSession = new Set();
   const labels = new Map(); // message id -> { label, score, explanation, signals }
@@ -80,12 +113,40 @@
 
   // ------------------------------------------------------------ extraction
 
-  const nodeText = (el) => (el.innerText || el.textContent || '').trim();
+  function nodeText(el) {
+    const ignore = TEXT_IGNORE_SELECTORS[SITE];
+    if (ignore) {
+      const copy = el.cloneNode(true);
+      copy.querySelectorAll(ignore).forEach((n) => n.remove());
+      return (copy.textContent || '').trim();
+    }
+    return (el.innerText || el.textContent || '').trim();
+  }
 
   function isCandidate(text) {
     return text.length >= MIN_LEN
       && text.length <= MAX_LEN
       && !NOISE_PATTERNS.some((re) => re.test(text));
+  }
+
+  function isOnRightSide(el) {
+    const bubble = el.closest('[data-pre-plain-text], .bubble-content, .message-content') || el;
+    const r = bubble.getBoundingClientRect();
+    if (!r.width) return false; // not laid out yet
+    const pane = document.querySelector(PANE_SELECTOR);
+    let left = 0;
+    let right = document.documentElement.clientWidth;
+    if (pane) {
+      const p = pane.getBoundingClientRect();
+      if (p.width) { left = p.left; right = p.right; }
+    }
+    return (right - r.right) < (r.left - left);
+  }
+
+  function isOwnMessage(el) {
+    const sel = OWN_MESSAGE_SELECTORS[SITE];
+    if (sel && el.closest(sel)) return true;
+    return OWN_BY_POSITION.has(SITE) && isOnRightSide(el);
   }
 
   // Returns [{ el, text }] for every real message currently in the page.
@@ -99,17 +160,18 @@
       return [];
     }
 
-    const ownSelector = SKIP_OWN_MESSAGES ? OWN_MESSAGE_SELECTORS[SITE] : null;
+    const skipInside = SKIP_INSIDE_SELECTORS[SITE];
 
     for (const selector of selectors) {
       const nodes = [];
       for (const el of document.querySelectorAll(selector)) {
         if (el.closest('[contenteditable="true"]')) continue; // the compose box
-        if (ownSelector && el.closest(ownSelector)) continue;
+        if (skipInside && el.closest(skipInside)) continue;   // quoted text
+        if (SKIP_OWN_MESSAGES && isOwnMessage(el)) continue;  // messages you sent
         const text = nodeText(el);
         if (isCandidate(text)) nodes.push({ el, text });
       }
-      if (nodes.length) return nodes;
+      if (nodes.length) { matchedEver = true; return nodes; }
     }
     return [];
   }
@@ -298,10 +360,15 @@
   function paintAll() {
     paintTimer = null;
     if (!enabled) return;
-    for (const { el, text } of collectMessageNodes()) {
+    const nodes = collectMessageNodes(); // all layout reads happen here, before any writes
+    const current = new Set(nodes.map((n) => n.el));
+    for (const { el, text } of nodes) {
       const info = labels.get(hashText(text));
       paintMessage(el, info && !HIDDEN_LABELS.has(info.label) ? info : null);
     }
+    document.querySelectorAll('[data-ddd-msg]').forEach((el) => {
+      if (!current.has(el)) paintMessage(el, null); // e.g. a sent message that was badged earlier
+    });
   }
 
   // Throttled (not debounced) so badges keep up even while the chat is constantly updating.
@@ -337,9 +404,19 @@
     schedulePaint(); // chat apps recreate nodes while scrolling; re-apply badges quickly
   }
 
+  // If nothing was ever recognised, say so in the console so the selectors can be fixed.
+  function noMatchHint() {
+    if (matchedEver || !SITE_SELECTORS[SITE]) return;
+    console.info(
+      `[DDD] No incoming messages recognised on ${SITE} yet. If a chat with received messages is open, `
+      + 'the selectors for this site need updating (SITE_SELECTORS in messaging-text-capture.js).'
+    );
+  }
+
   async function startObserving() {
     if (observer) return;
     injectStyle();
+    setTimeout(noMatchHint, 8000);
     observer = new MutationObserver(onDomChange);
     observer.observe(document.body, {
       childList: true,
