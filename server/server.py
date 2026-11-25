@@ -53,10 +53,13 @@ LLM_CONCURRENCY = 4
 LLM_TIMEOUT_S = 20
 LLM_CACHE_SIZE = 2000
 
-# A "ham" prediction needs at least this much confidence to count as fully safe.
+# A "ham" prediction below this confidence is still sent to Gemini for a second look
+# (if Gemini is enabled), but without a separate "low_risk" bucket it resolves to "safe"
+# unless Gemini escalates it.
 SAFE_THRESHOLD = float(os.getenv("SAFE_THRESHOLD", "0.85"))
 
-LEVELS = ["safe", "low_risk", "suspicious", "harmful"]
+LEVELS = ["safe", "suspicious", "harmful"]
+PRIORITY = {"harmful": 1, "suspicious": 2, "safe": 3}
 
 SYSTEM_PROMPT = """You are a phishing/scam detection assistant. Given a message, analyze it for signs of
 phishing, scam, or social engineering intent. Look specifically for:
@@ -131,12 +134,12 @@ def ml_classify(texts):
 
 
 def ml_level(pred: str, p: dict) -> int:
-    """Map the classifier's output to a 0-3 risk level. Agree on these rules with the ML team."""
+    """Map the classifier's output to a 0-2 risk level (0=safe, 1=suspicious, 2=harmful)."""
     if pred == "ham":
-        return 0 if p.get("ham", 0.0) >= SAFE_THRESHOLD else 1
+        return 0
     if pred in ("smishing", "phishing"):
-        return 3
-    return 2  # spam, or any other non-ham class
+        return 2
+    return 1  # spam, or any other non-ham class
 
 
 # ------------------------------------------------------------------- Gemini
@@ -189,13 +192,13 @@ async def llm_analyze(text: str):
 
 
 def combine(level: int, llm: dict) -> int:
-    """Gemini may escalate, or soften by one step (never below low_risk). Tune with the ML team."""
+    """Gemini may escalate, or soften by one step down to safe."""
     risk = llm["risk"]
     if risk == "high":
-        return max(level, 3 if level >= 2 else 2)
+        return max(level, 2 if level >= 1 else 1)
     if risk == "medium":
-        return max(level, 2)
-    return max(1, level - 1) if level >= 2 else level
+        return max(level, 1)
+    return max(0, level - 1)
 
 
 # --------------------------------------------------------------- endpoints
@@ -226,13 +229,18 @@ async def classify(req: ClassifyRequest):
     texts = [m.text[:MAX_TEXT_LEN] for m in req.messages]
     preds = await asyncio.to_thread(ml_classify, texts)
 
-    results, levels = [], []
-    for m, (pred, p) in zip(req.messages, preds):
+    results, levels, needs_llm = [], [], []
+    for i, (m, (pred, p)) in enumerate(zip(req.messages, preds)):
         level = ml_level(pred, p)
         levels.append(level)
+        uncertain_ham = pred == "ham" and p.get("ham", 0.0) < SAFE_THRESHOLD
+        if level >= 1 or uncertain_ham:
+            needs_llm.append(i)
+        label = LEVELS[level]
         results.append({
             "id": m.id,
-            "label": LEVELS[level],
+            "label": label,
+            "priority": PRIORITY[label],
             "score": round(1.0 - p.get("ham", 0.0), 4),  # 0 = looks like normal chat, 1 = looks malicious
             "source": "ml",
             "ml": {"prediction": pred, "probabilities": {k: round(v, 4) for k, v in p.items()}},
@@ -240,16 +248,18 @@ async def classify(req: ClassifyRequest):
             "signals": [],
         })
 
-    # Gemini only for messages that are not clearly safe, riskiest first, capped per request.
+    # Gemini only for non-safe or low-confidence ham messages, riskiest first, capped per request.
     if state["llm"] is not None:
-        order = sorted((i for i, lv in enumerate(levels) if lv >= 1), key=lambda i: -levels[i])
+        order = sorted(needs_llm, key=lambda i: -levels[i])
         chosen = order[:MAX_LLM_PER_REQUEST]
         analyses = await asyncio.gather(*(llm_analyze(texts[i]) for i in chosen))
         for i, a in zip(chosen, analyses):
             if not a:
                 continue
             r = results[i]
-            r["label"] = LEVELS[combine(levels[i], a)]
+            new_label = LEVELS[combine(levels[i], a)]
+            r["label"] = new_label
+            r["priority"] = PRIORITY[new_label]
             r["source"] = "ml+llm"
             r["explanation"] = a["explanation"]
             r["signals"] = a["signals"]

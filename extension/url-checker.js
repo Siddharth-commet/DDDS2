@@ -1,8 +1,8 @@
 // url-checker.js — content script
 // Checks links inside incoming chat messages via background.js.
-// Instead of underlining links, any link flagged as unsafe (harmful) or caution
-// (suspicious) reports a URL flag to messaging-text-capture.js so the text message
-// itself receives the Harmful / Suspicious label.
+// Instead of underlining links, it reports URL verdicts (harmful, suspicious, or safe)
+// to messaging-text-capture.js so the text message itself is labeled using priority:
+//   harmful: 1, suspicious: 2, safe: 3   (lesser number wins)
 
 (() => {
   const SCAN_DEBOUNCE_MS = 500;
@@ -10,13 +10,13 @@
   const RETRY_BACKOFF_MS = 30000;
   const MAX_URLS_PER_FLUSH = 100;
 
-  // Map URL checker verdicts to message-level risk labels.
-  // Safe/unknown links do not override or label the message.
+  // Map URL checker verdicts to internal classification labels and priorities.
   const VERDICT_TO_FLAG = {
     unsafe: { label: 'harmful', score: 0.95 },
     caution: { label: 'suspicious', score: 0.65 },
+    safe: { label: 'safe', score: 0.05 },
   };
-  const SEVERITY = { suspicious: 2, harmful: 3 };
+  const PRIORITY = { harmful: 1, suspicious: 2, safe: 3 };
 
   // Chat apps often wrap outgoing links in a redirector; unwrap to the real target.
   const REDIRECTORS = {
@@ -106,7 +106,7 @@
     const cached = verdicts.get(target);
     const mismatch = textHostMismatch(a, hostOf(target));
 
-    if (!cached && !mismatch) return null;
+    if (!cached && !mismatch) return { state: 'pending' };
 
     let verdict = cached?.verdict || 'unknown';
     let reasons = cached?.reasons ? [...cached.reasons] : [];
@@ -117,12 +117,15 @@
     }
 
     const mapped = VERDICT_TO_FLAG[verdict];
-    if (!mapped) return null;
+    if (!mapped) {
+      return { state: 'unknown', reasons };
+    }
 
     return {
+      state: 'classified',
       label: mapped.label,
       score: mapped.score,
-      reasons: reasons.length ? reasons : [`Flagged link (${target})`],
+      reasons,
     };
   }
 
@@ -148,7 +151,7 @@
 
     const containerSel = bridge?.getMessageContainerSelector?.() || null;
     const containerIndex = buildContainerIndex(nodes, containerSel);
-    const flagsById = new Map();
+    const perMessage = new Map(); // id -> { bestLabel, bestScore, reasons, hasPending, hasUnknown, unknownReasons }
 
     for (const a of document.querySelectorAll('a[href]')) {
       if (a.closest('[contenteditable="true"]')) continue;       // the compose box
@@ -162,24 +165,66 @@
 
       if (!verdicts.has(target)) queue(target);
 
-      const linkFlag = evaluateLink(a, target);
-      if (!linkFlag) continue;
+      let entry = perMessage.get(owner.id);
+      if (!entry) {
+        entry = {
+          bestLabel: null,
+          bestScore: 0,
+          reasons: [],
+          hasPending: false,
+          hasUnknown: false,
+          unknownReasons: [],
+        };
+        perMessage.set(owner.id, entry);
+      }
 
-      const existing = flagsById.get(owner.id);
-      if (!existing) {
-        flagsById.set(owner.id, {
-          label: linkFlag.label,
-          score: linkFlag.score,
-          reasons: [...new Set(linkFlag.reasons)],
+      const res = evaluateLink(a, target);
+      if (res.state === 'pending') {
+        entry.hasPending = true;
+        continue;
+      }
+      if (res.state === 'unknown') {
+        entry.hasUnknown = true;
+        for (const r of res.reasons) {
+          if (!entry.unknownReasons.includes(r)) entry.unknownReasons.push(r);
+        }
+        continue;
+      }
+
+      if (!entry.bestLabel || PRIORITY[res.label] < PRIORITY[entry.bestLabel]) {
+        entry.bestLabel = res.label;
+      }
+      entry.bestScore = Math.max(entry.bestScore, res.score);
+      if (res.label !== 'safe') {
+        for (const r of res.reasons) {
+          if (!entry.reasons.includes(r)) entry.reasons.push(r);
+        }
+      } else if (entry.reasons.length === 0) {
+        for (const r of res.reasons) {
+          if (!entry.reasons.includes(r)) entry.reasons.push(r);
+        }
+      }
+    }
+
+    const flagsById = new Map();
+    for (const [id, entry] of perMessage.entries()) {
+      if (entry.bestLabel === 'harmful' || entry.bestLabel === 'suspicious') {
+        flagsById.set(id, {
+          label: entry.bestLabel,
+          score: entry.bestScore,
+          reasons: entry.reasons,
         });
-      } else {
-        if (SEVERITY[linkFlag.label] > SEVERITY[existing.label]) {
-          existing.label = linkFlag.label;
-        }
-        existing.score = Math.max(existing.score, linkFlag.score);
-        for (const r of linkFlag.reasons) {
-          if (!existing.reasons.includes(r)) existing.reasons.push(r);
-        }
+      } else if (!entry.hasPending && entry.bestLabel === 'safe' && !entry.hasUnknown) {
+        flagsById.set(id, {
+          label: 'safe',
+          score: entry.bestScore,
+          reasons: entry.reasons,
+        });
+      } else if (!entry.hasPending && entry.hasUnknown && !entry.bestLabel) {
+        flagsById.set(id, {
+          label: 'unknown',
+          reasons: entry.unknownReasons,
+        });
       }
     }
 

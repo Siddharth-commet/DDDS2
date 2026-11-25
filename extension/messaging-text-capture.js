@@ -2,11 +2,14 @@
 //
 // 1. Finds the real message elements on the page (per-site selectors below). It no longer
 //    falls back to "all page text", so times, contact names and menus are never captured.
-// 2. Stores each new message and sends it to the ML server (via background.js) for a label:
-//      safe | low_risk | suspicious | harmful
-// 3. Combines ML labels with URL reputation flags (from url-checker.js) so a harmful or
-//    suspicious link labels the text message itself.
-// 4. Shows that label on the message itself in the chat, as a small badge.
+// 2. Separates URL-only messages from text / URL+text messages:
+//      - URL-only messages are NEVER passed to the ML model; only the URL tester checks them.
+//      - Mixed (URL+text) messages strip URLs before sending the text portion to ML, while
+//        the URL tester checks the URLs.
+// 3. Compares text & URL labels using internal priorities:
+//      harmful: 1, suspicious: 2, safe: 3   (lower number = higher priority wins)
+//    Note: "low_risk" is dropped and treated as "safe".
+// 4. Shows the resulting label on the message itself in the chat, as a small badge.
 //
 // Badges are drawn with a CSS ::after rule driven by a data attribute, so no nodes are
 // inserted into the chat app's DOM (safer with React re-renders) and the message text
@@ -23,9 +26,13 @@
   const CLASSIFY_BATCH = 50;      // messages per request to the ML server
   const RETRY_BACKOFF_MS = 30000; // wait this long after the ML server fails
 
-  const VALID_LABELS = new Set(['safe', 'low_risk', 'suspicious', 'harmful']);
-  const LEVEL_RANK = { safe: 0, low_risk: 1, suspicious: 2, harmful: 3 };
-  const LABEL_NAMES = { safe: 'Safe', low_risk: 'Low risk', suspicious: 'Suspicious', harmful: 'Harmful' };
+  const VALID_LABELS = new Set(['safe', 'suspicious', 'harmful']);
+  // Internal classification priority: lower number = higher priority.
+  const PRIORITY = { harmful: 1, suspicious: 2, safe: 3 };
+  const LABEL_NAMES = { safe: 'Safe', suspicious: 'Suspicious', harmful: 'Harmful' };
+
+  const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"{}|\\^`\[\]]+/gi;
+  const DOMAIN_TEXT_RE = /^(?:https?:\/\/)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:[/?#:]\S*)?$/i;
 
   // ---- settings you may want to change -------------------------------------------------
   // Labels listed here are classified but not shown in the chat,
@@ -125,9 +132,10 @@
   let matchedEver = false;
 
   const seenThisSession = new Set();
-  const labels = new Map();   // message id -> { label, score, explanation, signals }
-  const mlResults = new Map(); // message id -> ml verdict object
-  const urlFlags = new Map();  // message id -> { label, score, reasons }
+  const labels = new Map();     // message id -> effective { label, score, explanation, signals, source }
+  const mlResults = new Map();  // message id -> ml verdict object
+  const urlFlags = new Map();   // message id -> { label, score, reasons }
+  const urlOnlyIds = new Set(); // message ids that contain only URL(s) and must skip ML
 
   // All storage read-modify-write operations run one at a time, so appending new
   // messages and writing back labels can never overwrite each other.
@@ -147,6 +155,10 @@
     return h.toString(36);
   }
 
+  function normalizeLabel(label) {
+    return label === 'low_risk' ? 'safe' : label;
+  }
+
   // ------------------------------------------------------------ extraction
 
   function nodeText(el) {
@@ -163,6 +175,33 @@
     return text.length >= MIN_LEN
       && text.length <= MAX_LEN
       && !NOISE_PATTERNS.some((re) => re.test(text));
+  }
+
+  function analyzeMessageContent(el, rawText) {
+    let hasUrl = URL_PATTERN.test(rawText);
+    URL_PATTERN.lastIndex = 0;
+
+    let stripped = rawText.replace(URL_PATTERN, ' ');
+    for (const a of el.querySelectorAll('a[href]')) {
+      const href = a.getAttribute('href') || '';
+      if (!/^https?:\/\//i.test(href)) continue;
+      hasUrl = true;
+      const linkText = (a.textContent || '').trim();
+      if (linkText && DOMAIN_TEXT_RE.test(linkText)) {
+        stripped = stripped.split(linkText).join(' ');
+      }
+    }
+
+    const textForMl = stripped.replace(/\s+/g, ' ').trim();
+    const alphaNum = textForMl.replace(/[\s.,!?;:()\[\]{}'"<>|/\\-]+/g, '');
+    const hasText = alphaNum.length >= 2;
+    const urlOnly = hasUrl && !hasText;
+
+    return {
+      hasUrl,
+      urlOnly,
+      mlText: hasText ? textForMl : '',
+    };
   }
 
   function isOnRightSide(el) {
@@ -186,7 +225,7 @@
     return OWN_BY_POSITION.has(SITE) && isOnRightSide(el);
   }
 
-  // Returns [{ el, text }] for every real message currently in the page.
+  // Returns [{ el, text, hasUrl, urlOnly, mlText }] for every real message currently in the page.
   function collectMessageNodes() {
     const selectors = SITE_SELECTORS[SITE];
     if (!selectors) {
@@ -206,7 +245,8 @@
         if (skipInside && el.closest(skipInside)) continue;   // quoted text
         if (SKIP_OWN_MESSAGES && isOwnMessage(el)) continue;  // messages you sent
         const text = nodeText(el);
-        if (isCandidate(text)) nodes.push({ el, text });
+        if (!isCandidate(text)) continue;
+        nodes.push({ el, text, ...analyzeMessageContent(el, text) });
       }
       if (nodes.length) { matchedEver = true; return nodes; }
     }
@@ -215,56 +255,101 @@
 
   // ------------------------------------------------------- verdict merging
 
-  function mergeVerdicts(ml, urlFlag) {
-    const hasMl = ml && VALID_LABELS.has(ml.label);
-    const hasUrl = urlFlag && VALID_LABELS.has(urlFlag.label);
-    if (!hasMl && !hasUrl) return null;
+  function mergeVerdicts(ml, urlFlag, isUrlOnly = false) {
+    const mlLabel = ml ? normalizeLabel(ml.label) : null;
+    const urlLabel = urlFlag ? normalizeLabel(urlFlag.label) : null;
+    const hasMl = !isUrlOnly && Boolean(mlLabel && VALID_LABELS.has(mlLabel));
+    const hasUrl = Boolean(urlLabel && VALID_LABELS.has(urlLabel));
 
-    let label;
+    // URL-only messages never use ML; only the URL tester labels them.
+    if (isUrlOnly) {
+      if (hasUrl) {
+        const reasons = Array.isArray(urlFlag.reasons) ? urlFlag.reasons : [];
+        return {
+          label: urlLabel,
+          score: urlFlag.score,
+          source: 'url',
+          explanation: reasons.length ? `URL check: ${reasons.join('; ')}` : '',
+          signals: urlLabel === 'safe' ? [] : [LABEL_NAMES[urlLabel] + ' link'],
+        };
+      }
+      if (urlFlag?.label === 'unknown') {
+        const reasons = Array.isArray(urlFlag.reasons) ? urlFlag.reasons : [];
+        return {
+          label: 'unclassified',
+          score: undefined,
+          source: 'url',
+          explanation: reasons.length ? `URL check: ${reasons.join('; ')}` : 'URL not verified',
+          signals: [],
+        };
+      }
+      return null;
+    }
+
+    // Both URL and text exist (or text-only): compare priorities (lower number wins).
     if (hasMl && hasUrl) {
-      label = LEVEL_RANK[urlFlag.label] >= LEVEL_RANK[ml.label] ? urlFlag.label : ml.label;
-    } else {
-      label = hasUrl ? urlFlag.label : ml.label;
+      const urlWins = PRIORITY[urlLabel] < PRIORITY[mlLabel];
+      const label = urlWins ? urlLabel : mlLabel;
+
+      const scores = [];
+      if (typeof ml.score === 'number') scores.push(ml.score);
+      if (typeof urlFlag.score === 'number') scores.push(urlFlag.score);
+      const score = scores.length ? Math.max(...scores) : undefined;
+
+      const expParts = [];
+      if (ml.explanation) expParts.push(ml.explanation);
+      if (Array.isArray(urlFlag.reasons) && urlFlag.reasons.length) {
+        expParts.push(`URL check (${urlLabel}): ${urlFlag.reasons.join('; ')}`);
+      }
+
+      const signals = [];
+      const seenSig = new Set();
+      for (const s of (Array.isArray(ml.signals) ? ml.signals : [])) {
+        if (!seenSig.has(s)) { seenSig.add(s); signals.push(s); }
+      }
+      if (urlLabel !== 'safe') {
+        const linkSig = `${LABEL_NAMES[urlLabel]} link`;
+        if (!seenSig.has(linkSig)) { seenSig.add(linkSig); signals.push(linkSig); }
+      }
+
+      return {
+        label,
+        score,
+        source: `${ml.source || 'ml'}+url`,
+        explanation: expParts.join(' | '),
+        signals,
+      };
     }
 
-    const scores = [];
-    if (hasMl && typeof ml.score === 'number') scores.push(ml.score);
-    if (hasUrl && typeof urlFlag.score === 'number') scores.push(urlFlag.score);
-    const score = scores.length ? Math.max(...scores) : undefined;
-
-    const sources = [];
-    if (hasMl && ml.source) sources.push(ml.source);
-    else if (hasMl) sources.push('ml');
-    if (hasUrl) sources.push('url');
-    const source = sources.join('+');
-
-    const expParts = [];
-    if (hasMl && ml.explanation) expParts.push(ml.explanation);
-    if (hasUrl && Array.isArray(urlFlag.reasons) && urlFlag.reasons.length) {
-      expParts.push(`Flagged link: ${urlFlag.reasons.join('; ')}`);
+    if (hasMl) {
+      return {
+        label: mlLabel,
+        score: ml.score,
+        source: ml.source || 'ml',
+        explanation: ml.explanation || '',
+        signals: Array.isArray(ml.signals) ? ml.signals : [],
+      };
     }
 
-    const signals = [];
-    const seenSig = new Set();
-    for (const s of (hasMl && Array.isArray(ml.signals) ? ml.signals : [])) {
-      if (!seenSig.has(s)) { seenSig.add(s); signals.push(s); }
-    }
-    if (hasUrl) {
-      const linkSig = urlFlag.label === 'harmful' ? 'Harmful link' : 'Suspicious link';
-      if (!seenSig.has(linkSig)) { seenSig.add(linkSig); signals.push(linkSig); }
+    // URL flagged harmful/suspicious before ML responded (or while ML server is offline).
+    if (hasUrl && (urlLabel === 'harmful' || urlLabel === 'suspicious')) {
+      const reasons = Array.isArray(urlFlag.reasons) ? urlFlag.reasons : [];
+      return {
+        label: urlLabel,
+        score: urlFlag.score,
+        source: 'url',
+        explanation: reasons.length ? `URL check: ${reasons.join('; ')}` : '',
+        signals: [`${LABEL_NAMES[urlLabel]} link`],
+      };
     }
 
-    return {
-      label,
-      score,
-      source,
-      explanation: expParts.join(' | '),
-      signals,
-    };
+    // Note: if urlLabel === 'safe' on a mixed message while ML is still pending,
+    // wait for ML so the text label determines the outcome (priority 1/2/3).
+    return null;
   }
 
   function applyEffectiveFields(m) {
-    const merged = mergeVerdicts(m.ml, m.urlFlag);
+    const merged = mergeVerdicts(m.ml, m.urlFlag, Boolean(m.urlOnly));
     if (merged) {
       m.status = merged.label;
       m.score = merged.score;
@@ -273,21 +358,21 @@
       m.signals = merged.signals;
       return;
     }
-    if (m.ml && m.ml.label === 'unclassified') {
+    if (!m.urlOnly && m.ml && m.ml.label === 'unclassified') {
       m.status = 'unclassified';
     }
   }
 
   function refreshInMemoryLabels(id) {
-    const merged = mergeVerdicts(mlResults.get(id), urlFlags.get(id));
-    if (merged) labels.set(id, merged);
+    const merged = mergeVerdicts(mlResults.get(id), urlFlags.get(id), urlOnlyIds.has(id));
+    if (merged && VALID_LABELS.has(merged.label)) labels.set(id, merged);
     else labels.delete(id);
   }
 
   // --------------------------------------------------------------- storage
 
-  function appendMessages(lines) {
-    if (lines.length === 0) return Promise.resolve();
+  function appendMessages(nodes) {
+    if (nodes.length === 0) return Promise.resolve();
 
     return enqueue(async () => {
       const stored = await chrome.storage.local.get(STORAGE_KEY);
@@ -295,17 +380,21 @@
       const existingIds = new Set(existing.map((m) => m.id));
 
       const additions = [];
-      for (const text of lines) {
-        const id = hashText(text);
+      for (const node of nodes) {
+        const id = hashText(node.text);
+        if (node.urlOnly) urlOnlyIds.add(id);
         if (seenThisSession.has(id) || existingIds.has(id)) continue;
         seenThisSession.add(id);
         const entry = {
           id,
           site: SITE,
           url: location.href,
-          text,
+          text: node.text,
+          mlText: node.mlText,
+          hasUrl: node.hasUrl,
+          urlOnly: node.urlOnly,
           capturedAt: new Date().toISOString(),
-          status: 'pending', // replaced by the ML / URL label
+          status: 'pending', // replaced by the ML and/or URL label
         };
         if (urlFlags.has(id)) {
           entry.urlFlag = urlFlags.get(id);
@@ -324,14 +413,14 @@
     });
   }
 
-  // Newest pending messages first, so what the user is reading gets labelled first.
+  // Newest pending non-URL-only messages first; URL-only messages are NEVER sent to ML.
   function pickPending() {
     return enqueue(async () => {
       const stored = await chrome.storage.local.get(STORAGE_KEY);
       return (stored[STORAGE_KEY] || [])
-        .filter((m) => m.status === 'pending' || (Boolean(m.urlFlag) && !m.ml))
+        .filter((m) => !m.urlOnly && (m.status === 'pending' || (Boolean(m.urlFlag) && !m.ml)))
         .slice(-CLASSIFY_BATCH)
-        .map(({ id, text }) => ({ id, text }));
+        .map((m) => ({ id: m.id, text: m.mlText || m.text }));
     });
   }
 
@@ -346,9 +435,10 @@
       for (const m of list) {
         if (!batchIds.has(m.id)) continue;
         const r = byId.get(m.id);
-        if (r && VALID_LABELS.has(r.label)) {
+        const normLabel = r ? normalizeLabel(r.label) : null;
+        if (r && VALID_LABELS.has(normLabel)) {
           m.ml = {
-            label: r.label,
+            label: normLabel,
             score: r.score,
             source: r.source || 'ml',
             explanation: r.explanation || '',
@@ -381,9 +471,9 @@
         const flag = flaggedEntries.get(m.id);
         if (!flag) continue;
         // Preserve legacy ML verdict if this message was classified before m.ml existed.
-        if (!m.ml && VALID_LABELS.has(m.status) && m.source !== 'url') {
+        if (!m.ml && !m.urlOnly && VALID_LABELS.has(normalizeLabel(m.status)) && m.source !== 'url') {
           m.ml = {
-            label: m.status,
+            label: normalizeLabel(m.status),
             score: m.score,
             source: m.source || 'ml',
             explanation: m.explanation || '',
@@ -413,7 +503,7 @@
     let changed = false;
     const toPersist = new Map();
     for (const [id, flag] of flagsById.entries()) {
-      if (!flag || !VALID_LABELS.has(flag.label)) continue;
+      if (!flag || (!VALID_LABELS.has(flag.label) && flag.label !== 'unknown')) continue;
       const prev = JSON.stringify(urlFlags.get(id) || null);
       const next = JSON.stringify(flag);
       if (prev !== next) {
@@ -477,7 +567,6 @@
         user-select: none;
       }
       [data-ddd-msg="safe"]::after       { content: "\\2713  Safe";        background: #dcfce7; color: #15803d; }
-      [data-ddd-msg="low_risk"]::after   { content: "Low risk";            background: #fef9c3; color: #854d0e; }
       [data-ddd-msg="suspicious"]::after { content: "\\26A0  Suspicious";  background: #ffedd5; color: #c2410c; }
       [data-ddd-msg="harmful"]::after    { content: "\\26D4  Harmful";     background: #fee2e2; color: #b91c1c; }
       [data-ddd-msg="suspicious"] {
@@ -500,11 +589,14 @@
     labels.clear();
     mlResults.clear();
     for (const m of list || []) {
-      const ml = m.ml && VALID_LABELS.has(m.ml.label)
-        ? m.ml
-        : (VALID_LABELS.has(m.status) && m.source !== 'url'
+      if (m.urlOnly) urlOnlyIds.add(m.id);
+      const mlNorm = m.ml ? normalizeLabel(m.ml.label) : null;
+      const statusNorm = normalizeLabel(m.status);
+      const ml = m.ml && VALID_LABELS.has(mlNorm)
+        ? { ...m.ml, label: mlNorm }
+        : (!m.urlOnly && VALID_LABELS.has(statusNorm) && m.source !== 'url'
           ? {
-              label: m.status,
+              label: statusNorm,
               score: m.score,
               source: m.source || 'ml',
               explanation: m.explanation,
@@ -512,11 +604,11 @@
             }
           : null);
       if (ml) mlResults.set(m.id, ml);
-      if (m.urlFlag && VALID_LABELS.has(m.urlFlag.label)) {
+      if (m.urlFlag && (VALID_LABELS.has(normalizeLabel(m.urlFlag.label)) || m.urlFlag.label === 'unknown')) {
         urlFlags.set(m.id, m.urlFlag);
       }
-      const merged = mergeVerdicts(ml, urlFlags.get(m.id));
-      if (merged) labels.set(m.id, merged);
+      const merged = mergeVerdicts(ml, urlFlags.get(m.id), Boolean(m.urlOnly));
+      if (merged && VALID_LABELS.has(merged.label)) labels.set(m.id, merged);
     }
     // Also keep any in-memory urlFlags for messages not yet persisted to storage.
     for (const id of urlFlags.keys()) {
@@ -579,7 +671,7 @@
   async function scan() {
     if (!enabled) return;
     if (!chrome.runtime?.id) { stopObserving(); return; } // extension reloaded; this script is orphaned
-    await appendMessages(collectMessageNodes().map((n) => n.text));
+    await appendMessages(collectMessageNodes());
     schedulePaint();
     classifyPending();
     globalThis.__DDD__?.onMessagesUpdated?.();
@@ -635,9 +727,11 @@
 
   // Shared bridge used by url-checker.js in the same extension content-script world.
   globalThis.__DDD__ = Object.assign(globalThis.__DDD__ || {}, {
-    getMessageNodes: () => collectMessageNodes().map(({ el, text }) => ({
+    getMessageNodes: () => collectMessageNodes().map(({ el, text, hasUrl, urlOnly }) => ({
       el,
       text,
+      hasUrl,
+      urlOnly,
       id: hashText(text),
     })),
     getMessageContainerSelector: () => MESSAGE_CONTAINER_SELECTORS[SITE] || null,
@@ -657,6 +751,7 @@
       if (!list || list.length === 0) {
         seenThisSession.clear(); // data was cleared; allow re-capture
         urlFlags.clear();
+        urlOnlyIds.clear();
       }
       rebuildLabels(list);
       schedulePaint();
