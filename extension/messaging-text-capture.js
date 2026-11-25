@@ -4,7 +4,9 @@
 //    falls back to "all page text", so times, contact names and menus are never captured.
 // 2. Stores each new message and sends it to the ML server (via background.js) for a label:
 //      safe | low_risk | suspicious | harmful
-// 3. Shows that label on the message itself in the chat, as a small badge.
+// 3. Combines ML labels with URL reputation flags (from url-checker.js) so a harmful or
+//    suspicious link labels the text message itself.
+// 4. Shows that label on the message itself in the chat, as a small badge.
 //
 // Badges are drawn with a CSS ::after rule driven by a data attribute, so no nodes are
 // inserted into the chat app's DOM (safer with React re-renders) and the message text
@@ -22,6 +24,7 @@
   const RETRY_BACKOFF_MS = 30000; // wait this long after the ML server fails
 
   const VALID_LABELS = new Set(['safe', 'low_risk', 'suspicious', 'harmful']);
+  const LEVEL_RANK = { safe: 0, low_risk: 1, suspicious: 2, harmful: 3 };
   const LABEL_NAMES = { safe: 'Safe', low_risk: 'Low risk', suspicious: 'Suspicious', harmful: 'Harmful' };
 
   // ---- settings you may want to change -------------------------------------------------
@@ -30,8 +33,8 @@
   const HIDDEN_LABELS = new Set();
 
   // true = only analyse INCOMING messages; messages you sent are ignored (not stored, not
-  // sent to the model, no badge). Only works on sites listed in OWN_MESSAGE_SELECTORS,
-  // which must match an ancestor of every message you sent. Other sites still check everything.
+  // sent to the model, no badge). Only works on sites listed in OWN_MESSAGE_SELECTORS or
+  // OWN_BY_POSITION. Other sites still check everything.
   // NOTE: in WhatsApp's "message yourself" chat every message counts as sent by you.
   const SKIP_OWN_MESSAGES = true;
   const OWN_MESSAGE_SELECTORS = {
@@ -44,12 +47,24 @@
 
   // Backup that does not depend on any class names: on these sites a bubble that sits on the
   // RIGHT side of the chat pane is one you sent, on the LEFT is one you received.
-  const OWN_BY_POSITION = new Set(['web.whatsapp.com', 'web.telegram.org']);
-  const PANE_SELECTOR = '#main, #column-center, #MiddleColumn'; // chat pane; falls back to the window
+  const OWN_BY_POSITION = new Set([
+    'web.whatsapp.com',
+    'web.telegram.org',
+    'messenger.com',
+    'www.messenger.com',
+  ]);
+  const PANE_SELECTORS = {
+    'web.whatsapp.com': '#main',
+    'web.telegram.org': '#column-center, #MiddleColumn',
+    'messenger.com': '[role="main"]',
+    'www.messenger.com': '[role="main"]',
+  };
 
   // Quoted/replied-to text shown inside a bubble is not a separate message.
   const SKIP_INSIDE_SELECTORS = {
     'web.whatsapp.com': '[aria-label^="Quoted"], [data-testid="quoted-message"]',
+    'messenger.com': '[aria-label^="Replying to"], [data-testid="reply_to_message"]',
+    'www.messenger.com': '[aria-label^="Replying to"], [data-testid="reply_to_message"]',
   };
 
   // Selectors for the element holding the TEXT of a message. Tried in order; the first one
@@ -59,7 +74,7 @@
     'web.whatsapp.com': ['[data-pre-plain-text] span.selectable-text', 'span.selectable-text.copyable-text'],
     'discord.com': ['[id^="message-content-"]'],
     'app.slack.com': ['.p-rich_text_section'],
-    // Telegram Web A (/a/) first, then Web K (/k/). Best guesses; see the README notes in chat.
+    // Telegram Web A (/a/) first, then Web K (/k/).
     'web.telegram.org': [
       '.Message .text-content',          // Web A
       '.bubble-content .message',        // Web K
@@ -67,6 +82,25 @@
       '.message.spoilers-container',
       '.text-content',
     ],
+    'messenger.com': [
+      '[data-testid="message-container"] [dir="auto"]',
+      '[role="main"] [role="row"] div[dir="auto"]',
+    ],
+    'www.messenger.com': [
+      '[data-testid="message-container"] [dir="auto"]',
+      '[role="main"] [role="row"] div[dir="auto"]',
+    ],
+  };
+
+  // Outer bubble/container per message, used by url-checker.js to associate preview-card
+  // links in the same bubble with this message when the <a> is outside the text span.
+  const MESSAGE_CONTAINER_SELECTORS = {
+    'web.whatsapp.com': '[data-pre-plain-text], [data-id]',
+    'discord.com': '[id^="chat-messages-"], li[class*="messageListItem"]',
+    'app.slack.com': '[data-qa="message_container"], .c-message_kit__background',
+    'web.telegram.org': '.bubble, .Message',
+    'messenger.com': '[data-testid="message-container"], [role="row"]',
+    'www.messenger.com': '[data-testid="message-container"], [role="row"]',
   };
 
   // Parts INSIDE a message element that are not message text (time, ticks, reactions).
@@ -91,7 +125,9 @@
   let matchedEver = false;
 
   const seenThisSession = new Set();
-  const labels = new Map(); // message id -> { label, score, explanation, signals }
+  const labels = new Map();   // message id -> { label, score, explanation, signals }
+  const mlResults = new Map(); // message id -> ml verdict object
+  const urlFlags = new Map();  // message id -> { label, score, reasons }
 
   // All storage read-modify-write operations run one at a time, so appending new
   // messages and writing back labels can never overwrite each other.
@@ -130,10 +166,11 @@
   }
 
   function isOnRightSide(el) {
-    const bubble = el.closest('[data-pre-plain-text], .bubble-content, .message-content') || el;
+    const bubble = el.closest('[data-pre-plain-text], .bubble-content, .message-content, [data-testid="message-container"]') || el;
     const r = bubble.getBoundingClientRect();
     if (!r.width) return false; // not laid out yet
-    const pane = document.querySelector(PANE_SELECTOR);
+    const paneSel = PANE_SELECTORS[SITE];
+    const pane = paneSel ? document.querySelector(paneSel) : null;
     let left = 0;
     let right = document.documentElement.clientWidth;
     if (pane) {
@@ -176,6 +213,77 @@
     return [];
   }
 
+  // ------------------------------------------------------- verdict merging
+
+  function mergeVerdicts(ml, urlFlag) {
+    const hasMl = ml && VALID_LABELS.has(ml.label);
+    const hasUrl = urlFlag && VALID_LABELS.has(urlFlag.label);
+    if (!hasMl && !hasUrl) return null;
+
+    let label;
+    if (hasMl && hasUrl) {
+      label = LEVEL_RANK[urlFlag.label] >= LEVEL_RANK[ml.label] ? urlFlag.label : ml.label;
+    } else {
+      label = hasUrl ? urlFlag.label : ml.label;
+    }
+
+    const scores = [];
+    if (hasMl && typeof ml.score === 'number') scores.push(ml.score);
+    if (hasUrl && typeof urlFlag.score === 'number') scores.push(urlFlag.score);
+    const score = scores.length ? Math.max(...scores) : undefined;
+
+    const sources = [];
+    if (hasMl && ml.source) sources.push(ml.source);
+    else if (hasMl) sources.push('ml');
+    if (hasUrl) sources.push('url');
+    const source = sources.join('+');
+
+    const expParts = [];
+    if (hasMl && ml.explanation) expParts.push(ml.explanation);
+    if (hasUrl && Array.isArray(urlFlag.reasons) && urlFlag.reasons.length) {
+      expParts.push(`Flagged link: ${urlFlag.reasons.join('; ')}`);
+    }
+
+    const signals = [];
+    const seenSig = new Set();
+    for (const s of (hasMl && Array.isArray(ml.signals) ? ml.signals : [])) {
+      if (!seenSig.has(s)) { seenSig.add(s); signals.push(s); }
+    }
+    if (hasUrl) {
+      const linkSig = urlFlag.label === 'harmful' ? 'Harmful link' : 'Suspicious link';
+      if (!seenSig.has(linkSig)) { seenSig.add(linkSig); signals.push(linkSig); }
+    }
+
+    return {
+      label,
+      score,
+      source,
+      explanation: expParts.join(' | '),
+      signals,
+    };
+  }
+
+  function applyEffectiveFields(m) {
+    const merged = mergeVerdicts(m.ml, m.urlFlag);
+    if (merged) {
+      m.status = merged.label;
+      m.score = merged.score;
+      m.source = merged.source;
+      m.explanation = merged.explanation;
+      m.signals = merged.signals;
+      return;
+    }
+    if (m.ml && m.ml.label === 'unclassified') {
+      m.status = 'unclassified';
+    }
+  }
+
+  function refreshInMemoryLabels(id) {
+    const merged = mergeVerdicts(mlResults.get(id), urlFlags.get(id));
+    if (merged) labels.set(id, merged);
+    else labels.delete(id);
+  }
+
   // --------------------------------------------------------------- storage
 
   function appendMessages(lines) {
@@ -191,14 +299,19 @@
         const id = hashText(text);
         if (seenThisSession.has(id) || existingIds.has(id)) continue;
         seenThisSession.add(id);
-        additions.push({
+        const entry = {
           id,
           site: SITE,
           url: location.href,
           text,
           capturedAt: new Date().toISOString(),
-          status: 'pending', // replaced by the ML label
-        });
+          status: 'pending', // replaced by the ML / URL label
+        };
+        if (urlFlags.has(id)) {
+          entry.urlFlag = urlFlags.get(id);
+          applyEffectiveFields(entry);
+        }
+        additions.push(entry);
       }
       if (additions.length === 0) return;
 
@@ -216,7 +329,7 @@
     return enqueue(async () => {
       const stored = await chrome.storage.local.get(STORAGE_KEY);
       return (stored[STORAGE_KEY] || [])
-        .filter((m) => m.status === 'pending')
+        .filter((m) => m.status === 'pending' || (Boolean(m.urlFlag) && !m.ml))
         .slice(-CLASSIFY_BATCH)
         .map(({ id, text }) => ({ id, text }));
     });
@@ -234,21 +347,84 @@
         if (!batchIds.has(m.id)) continue;
         const r = byId.get(m.id);
         if (r && VALID_LABELS.has(r.label)) {
-          m.status = r.label;
-          m.score = r.score;
-          m.source = r.source || '';
-          m.explanation = r.explanation || '';
-          m.signals = r.signals || [];
+          m.ml = {
+            label: r.label,
+            score: r.score,
+            source: r.source || 'ml',
+            explanation: r.explanation || '',
+            signals: r.signals || [],
+          };
           m.classifiedAt = new Date().toISOString();
+          mlResults.set(m.id, m.ml);
         } else {
-          m.status = 'unclassified'; // server skipped it; don't retry forever
+          m.ml = { label: 'unclassified' }; // server skipped it; don't retry forever
         }
+        if (!m.urlFlag && urlFlags.has(m.id)) m.urlFlag = urlFlags.get(m.id);
+        applyEffectiveFields(m);
       }
       await chrome.storage.local.set({ [STORAGE_KEY]: list });
 
       rebuildLabels(list);
       schedulePaint();
     });
+  }
+
+  function persistUrlFlags(flaggedEntries) {
+    if (flaggedEntries.size === 0) return Promise.resolve();
+
+    return enqueue(async () => {
+      const stored = await chrome.storage.local.get(STORAGE_KEY);
+      const list = stored[STORAGE_KEY] || [];
+      let changed = false;
+
+      for (const m of list) {
+        const flag = flaggedEntries.get(m.id);
+        if (!flag) continue;
+        // Preserve legacy ML verdict if this message was classified before m.ml existed.
+        if (!m.ml && VALID_LABELS.has(m.status) && m.source !== 'url') {
+          m.ml = {
+            label: m.status,
+            score: m.score,
+            source: m.source || 'ml',
+            explanation: m.explanation || '',
+            signals: m.signals || [],
+          };
+          mlResults.set(m.id, m.ml);
+        }
+        const prev = JSON.stringify(m.urlFlag || null);
+        const next = JSON.stringify(flag);
+        if (prev !== next) {
+          m.urlFlag = flag;
+          applyEffectiveFields(m);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        await chrome.storage.local.set({ [STORAGE_KEY]: list });
+        rebuildLabels(list);
+        schedulePaint();
+      }
+    });
+  }
+
+  function setUrlFlags(flagsById) {
+    if (!flagsById || flagsById.size === 0) return;
+    let changed = false;
+    const toPersist = new Map();
+    for (const [id, flag] of flagsById.entries()) {
+      if (!flag || !VALID_LABELS.has(flag.label)) continue;
+      const prev = JSON.stringify(urlFlags.get(id) || null);
+      const next = JSON.stringify(flag);
+      if (prev !== next) {
+        urlFlags.set(id, flag);
+        refreshInMemoryLabels(id);
+        changed = true;
+      }
+      toPersist.set(id, flag);
+    }
+    if (changed) schedulePaint();
+    persistUrlFlags(toPersist);
   }
 
   // -------------------------------------------------------- classification
@@ -322,15 +498,29 @@
 
   function rebuildLabels(list) {
     labels.clear();
+    mlResults.clear();
     for (const m of list || []) {
-      if (VALID_LABELS.has(m.status)) {
-        labels.set(m.id, {
-          label: m.status,
-          score: m.score,
-          explanation: m.explanation,
-          signals: m.signals,
-        });
+      const ml = m.ml && VALID_LABELS.has(m.ml.label)
+        ? m.ml
+        : (VALID_LABELS.has(m.status) && m.source !== 'url'
+          ? {
+              label: m.status,
+              score: m.score,
+              source: m.source || 'ml',
+              explanation: m.explanation,
+              signals: m.signals,
+            }
+          : null);
+      if (ml) mlResults.set(m.id, ml);
+      if (m.urlFlag && VALID_LABELS.has(m.urlFlag.label)) {
+        urlFlags.set(m.id, m.urlFlag);
       }
+      const merged = mergeVerdicts(ml, urlFlags.get(m.id));
+      if (merged) labels.set(m.id, merged);
+    }
+    // Also keep any in-memory urlFlags for messages not yet persisted to storage.
+    for (const id of urlFlags.keys()) {
+      if (!labels.has(id)) refreshInMemoryLabels(id);
     }
   }
 
@@ -392,6 +582,7 @@
     await appendMessages(collectMessageNodes().map((n) => n.text));
     schedulePaint();
     classifyPending();
+    globalThis.__DDD__?.onMessagesUpdated?.();
   }
 
   function scheduleScan() {
@@ -442,6 +633,17 @@
     try { clearMarks(); } catch { /* page may be unloading */ }
   }
 
+  // Shared bridge used by url-checker.js in the same extension content-script world.
+  globalThis.__DDD__ = Object.assign(globalThis.__DDD__ || {}, {
+    getMessageNodes: () => collectMessageNodes().map(({ el, text }) => ({
+      el,
+      text,
+      id: hashText(text),
+    })),
+    getMessageContainerSelector: () => MESSAGE_CONTAINER_SELECTORS[SITE] || null,
+    setUrlFlags,
+  });
+
   chrome.storage.local.get(['enabled'], (res) => {
     enabled = res.enabled !== false;
     if (enabled) startObserving();
@@ -452,7 +654,10 @@
 
     if (changes[STORAGE_KEY]) {
       const list = changes[STORAGE_KEY].newValue;
-      if (!list || list.length === 0) seenThisSession.clear(); // data was cleared; allow re-capture
+      if (!list || list.length === 0) {
+        seenThisSession.clear(); // data was cleared; allow re-capture
+        urlFlags.clear();
+      }
       rebuildLabels(list);
       schedulePaint();
     }

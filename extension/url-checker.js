@@ -1,21 +1,22 @@
 // url-checker.js — content script
-// Finds links in the chat, asks background.js for a verdict, and colours the
-// underline: green = safe, red = unsafe, amber = caution, grey = unchecked.
-// It only sets data-* attributes (+ a tooltip); the colours come from one
-// injected stylesheet, so the message text itself is never rewritten.
+// Checks links inside incoming chat messages via background.js.
+// Instead of underlining links, any link flagged as unsafe (harmful) or caution
+// (suspicious) reports a URL flag to messaging-text-capture.js so the text message
+// itself receives the Harmful / Suspicious label.
 
 (() => {
-  const STYLE_ID = '__ddd_url_style__';
   const SCAN_DEBOUNCE_MS = 500;
   const BATCH_MS = 400;
   const RETRY_BACKOFF_MS = 30000;
+  const MAX_URLS_PER_FLUSH = 100;
 
-  const LABELS = {
-    safe: 'Looks safe',
-    unsafe: 'Unsafe',
-    caution: 'Be careful',
-    unknown: 'Not verified',
+  // Map URL checker verdicts to message-level risk labels.
+  // Safe/unknown links do not override or label the message.
+  const VERDICT_TO_FLAG = {
+    unsafe: { label: 'harmful', score: 0.95 },
+    caution: { label: 'suspicious', score: 0.65 },
   };
+  const SEVERITY = { suspicious: 2, harmful: 3 };
 
   // Chat apps often wrap outgoing links in a redirector; unwrap to the real target.
   const REDIRECTORS = {
@@ -35,27 +36,6 @@
   const verdicts = new Map();  // target URL -> { verdict, reasons }
   const pending = new Set();   // URLs waiting to be sent
   const inFlight = new Set();  // URLs sent, awaiting a reply
-
-  // ------------------------------------------------------------------ styling
-
-  function injectStyle() {
-    if (document.getElementById(STYLE_ID)) return;
-    const s = document.createElement('style');
-    s.id = STYLE_ID;
-    s.textContent = `
-      a[data-ddd] {
-        text-decoration-line: underline !important;
-        text-decoration-thickness: 2px !important;
-        text-underline-offset: 2px !important;
-      }
-      a[data-ddd="safe"]    { text-decoration-color: #16a34a !important; text-decoration-style: solid  !important; }
-      a[data-ddd="unsafe"]  { text-decoration-color: #dc2626 !important; text-decoration-style: solid  !important; }
-      a[data-ddd="caution"] { text-decoration-color: #f59e0b !important; text-decoration-style: solid  !important; }
-      a[data-ddd="unknown"] { text-decoration-color: #9ca3af !important; text-decoration-style: solid  !important; }
-      a[data-ddd="pending"] { text-decoration-color: #9ca3af !important; text-decoration-style: dotted !important; }
-    `;
-    document.documentElement.appendChild(s);
-  }
 
   // ------------------------------------------------------------ URL helpers
 
@@ -90,37 +70,66 @@
     return shown !== real && !real.endsWith('.' + shown) && !shown.endsWith('.' + real);
   }
 
-  // ----------------------------------------------------------------- painting
+  // ------------------------------------------------ message association
 
-  function paint(a, target) {
-    let r = verdicts.get(target);
-    if (!r) return false;
-
-    if (textHostMismatch(a, hostOf(target))) {
-      r = {
-        verdict: 'unsafe',
-        reasons: ['Link text shows a different site than where it really goes', ...r.reasons],
-      };
+  function buildContainerIndex(nodes, containerSel) {
+    const map = new Map();
+    if (!containerSel) return map;
+    for (const node of nodes) {
+      const container = node.el.closest(containerSel);
+      if (!container) continue;
+      if (!map.has(container)) map.set(container, node);
+      else map.set(container, null); // ambiguous container with multiple message nodes
     }
-
-    a.dataset.ddd = r.verdict;
-    const tip = `[DDD] ${LABELS[r.verdict]}${r.reasons.length ? ': ' + r.reasons.join('; ') : ''}`;
-    if (!a.title || a.title.startsWith('[DDD]')) a.title = tip;
-    return true;
+    return map;
   }
 
-  function clearMarks() {
-    document.querySelectorAll('a[data-ddd]').forEach((a) => {
-      delete a.dataset.ddd;
-      delete a.dataset.dddUrl;
-      if (a.title.startsWith('[DDD]')) a.removeAttribute('title');
-    });
+  function findOwningMessage(a, nodes, containerSel, containerIndex) {
+    // 1. Direct descendant of a captured message text element (most common).
+    let match = null;
+    for (const node of nodes) {
+      if (node.el.contains(a)) {
+        if (!match || match.el.contains(node.el)) match = node;
+      }
+    }
+    if (match) return match;
+
+    // 2. Fallback: link preview card inside the same message bubble container.
+    if (containerSel) {
+      const container = a.closest(containerSel);
+      if (container) return containerIndex.get(container) || null;
+    }
+    return null;
+  }
+
+  function evaluateLink(a, target) {
+    const cached = verdicts.get(target);
+    const mismatch = textHostMismatch(a, hostOf(target));
+
+    if (!cached && !mismatch) return null;
+
+    let verdict = cached?.verdict || 'unknown';
+    let reasons = cached?.reasons ? [...cached.reasons] : [];
+
+    if (mismatch) {
+      verdict = 'unsafe';
+      reasons.unshift('Link text shows a different site than where it really goes');
+    }
+
+    const mapped = VERDICT_TO_FLAG[verdict];
+    if (!mapped) return null;
+
+    return {
+      label: mapped.label,
+      score: mapped.score,
+      reasons: reasons.length ? reasons : [`Flagged link (${target})`],
+    };
   }
 
   // ----------------------------------------------------------------- scanning
 
   function queue(url) {
-    if (inFlight.has(url) || Date.now() < retryAfter) return;
+    if (verdicts.has(url) || inFlight.has(url) || Date.now() < retryAfter) return;
     pending.add(url);
     scheduleFlush(BATCH_MS);
   }
@@ -133,6 +142,14 @@
   function scan() {
     if (!enabled) return;
 
+    const bridge = globalThis.__DDD__;
+    const nodes = bridge?.getMessageNodes?.() || [];
+    if (nodes.length === 0) return;
+
+    const containerSel = bridge?.getMessageContainerSelector?.() || null;
+    const containerIndex = buildContainerIndex(nodes, containerSel);
+    const flagsById = new Map();
+
     for (const a of document.querySelectorAll('a[href]')) {
       if (a.closest('[contenteditable="true"]')) continue;       // the compose box
 
@@ -140,14 +157,34 @@
       if (!target) continue;
       if (hostOf(target) === location.hostname) continue;        // in-app navigation
 
-      // Already handled and final: skip.
-      if (a.dataset.dddUrl === target && a.dataset.ddd && a.dataset.ddd !== 'pending') continue;
+      const owner = findOwningMessage(a, nodes, containerSel, containerIndex);
+      if (!owner) continue;
 
-      a.dataset.dddUrl = target;
-      if (!paint(a, target)) {
-        a.dataset.ddd = 'pending';
-        queue(target);
+      if (!verdicts.has(target)) queue(target);
+
+      const linkFlag = evaluateLink(a, target);
+      if (!linkFlag) continue;
+
+      const existing = flagsById.get(owner.id);
+      if (!existing) {
+        flagsById.set(owner.id, {
+          label: linkFlag.label,
+          score: linkFlag.score,
+          reasons: [...new Set(linkFlag.reasons)],
+        });
+      } else {
+        if (SEVERITY[linkFlag.label] > SEVERITY[existing.label]) {
+          existing.label = linkFlag.label;
+        }
+        existing.score = Math.max(existing.score, linkFlag.score);
+        for (const r of linkFlag.reasons) {
+          if (!existing.reasons.includes(r)) existing.reasons.push(r);
+        }
       }
+    }
+
+    if (flagsById.size > 0) {
+      bridge?.setUrlFlags?.(flagsById);
     }
   }
 
@@ -162,9 +199,12 @@
 
     if (!chrome.runtime?.id) { stop(); return; } // extension was reloaded; this script is orphaned
 
-    const urls = [...pending];
-    pending.clear();
-    urls.forEach((u) => inFlight.add(u));
+    const allPending = [...pending];
+    const urls = allPending.slice(0, MAX_URLS_PER_FLUSH);
+    for (const u of urls) {
+      pending.delete(u);
+      inFlight.add(u);
+    }
 
     let resp = null;
     try {
@@ -176,8 +216,9 @@
 
     if (resp?.ok) {
       for (const [url, r] of Object.entries(resp.results)) verdicts.set(url, r);
+      if (pending.size > 0) scheduleFlush(BATCH_MS);
     } else {
-      retryAfter = Date.now() + RETRY_BACKOFF_MS; // links stay grey; a later scan retries
+      retryAfter = Date.now() + RETRY_BACKOFF_MS; // a later scan retries
     }
     scan();
   }
@@ -186,7 +227,6 @@
 
   function start() {
     if (observer) return;
-    injectStyle();
     observer = new MutationObserver(scheduleScan);
     observer.observe(document.body, {
       childList: true,
@@ -203,18 +243,32 @@
     clearTimeout(flushTimer);
     flushTimer = null;
     pending.clear();
-    try { clearMarks(); } catch { /* page may be unloading */ }
   }
 
-  // Respect the same on/off toggle as the rest of the extension.
+  globalThis.__DDD__ = Object.assign(globalThis.__DDD__ || {}, {
+    onMessagesUpdated: scheduleScan,
+  });
+
+  // Respect the same on/off toggle as the rest of the extension, and invalidate
+  // in-memory verdicts if the user updates their Safe Browsing API key.
   chrome.storage.local.get(['enabled'], (res) => {
     enabled = res.enabled !== false;
     if (enabled) start();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'local' || !changes.enabled) return;
-    enabled = changes.enabled.newValue !== false;
-    if (enabled) start(); else stop();
+    if (area !== 'local') return;
+
+    if (changes.safeBrowsingKey) {
+      verdicts.clear();
+      pending.clear();
+      retryAfter = 0;
+      if (enabled) scan();
+    }
+
+    if (changes.enabled) {
+      enabled = changes.enabled.newValue !== false;
+      if (enabled) start(); else stop();
+    }
   });
 })();

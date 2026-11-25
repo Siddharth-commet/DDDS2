@@ -29,13 +29,16 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / "credentials.env")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ddd")  # NOTE: message text is never logged
 
 # ------------------------------------------------------------------ config
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "models"))
+_raw_model_dir = Path(os.getenv("MODEL_DIR", "models"))
+MODEL_DIR = _raw_model_dir if _raw_model_dir.is_absolute() else BASE_DIR / _raw_model_dir
 CLASSIFIER_FILE = os.getenv("CLASSIFIER_FILE", "message_classifier_logreg.joblib")
 VECTORIZER_FILE = os.getenv("VECTORIZER_FILE", "tfidf_vectorizer.joblib")
 
